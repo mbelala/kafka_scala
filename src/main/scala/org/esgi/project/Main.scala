@@ -21,7 +21,7 @@ import org.apache.kafka.streams.scala.kstream._
 import org.apache.kafka.streams.kstream.Printed
 import org.apache.kafka.streams.state.{QueryableStoreTypes, ReadOnlyKeyValueStore, ReadOnlyWindowStore, WindowStoreIterator}
 import org.apache.kafka.streams.{KafkaStreams, StreamsConfig, Topology}
-import org.esgi.project.models.{BestView, View, view_count}
+import org.esgi.project.models.{BestView, View, view_count, Like,LikeCount,BestScore}
 import org.slf4j.{Logger, LoggerFactory}
 import play.api.libs.json.{JsValue, Json}
 import io.github.azhur.kafkaserdeplayjson.{PlayJsonSupport => coucou}
@@ -42,8 +42,7 @@ object Main extends PlayJsonSupport with coucou {
   val props: Properties = {
     val p = new Properties()
     p.put(StreamsConfig.APPLICATION_ID_CONFIG, "manalkafka")
-    p.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "212.47.229.218:9092")
-    p.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest")
+    p.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092")
     p
   }
 
@@ -82,7 +81,16 @@ object Main extends PlayJsonSupport with coucou {
       }
       .groupByKey(Serialized.`with`(Serdes.Integer, PlaySerdes.create))
 
+    val groupedBylike: KGroupedStream[Int, JsValue] = viewsStream
+      .map { (_, like) =>
+        val parsedVisit = like.as[Like]
+        (parsedVisit._id, like)
+      }
+      .groupByKey(Serialized.`with`(Serdes.Integer, PlaySerdes.create))
 
+
+    val hgfd: TimeWindowedKStream[Int, JsValue] = groupedByUrl
+      .windowedBy(TimeWindows.of(30.seconds.toMillis).advanceBy(1.second.toMillis))
     // window per asked time frames
     val thirtySecondsWindowedVisits: TimeWindowedKStream[Int, JsValue] = groupedByUrl
       .windowedBy(TimeWindows.of(30.seconds.toMillis).advanceBy(1.second.toMillis))
@@ -96,9 +104,18 @@ object Main extends PlayJsonSupport with coucou {
     // count hits
     val bestviews: KTable[Int, view_count] = groupedByUrl
 //      .count()(Materialized.as(StoreView).withValueSerde(Serdes.Long))
-      .aggregate(view_count(0,"",0))((_, newValue , currentValue) => view_count(_id = currentValue._id,title = currentValue.title, view_count = currentValue.view_count+ 1))(Materialized.as(StoreView).withValueSerde(toSerde)) // aggregate version
+      .aggregate(view_count(0,"",0)){ (_, newValue , currentValue) =>
+        val newvalview = newValue.as[View]
+        view_count(_id = newvalview._id,title = newvalview.title, view_count = currentValue.view_count+ 1)
+      }(Materialized.as(StoreView).withValueSerde(toSerde)) // aggregate version
 
-
+    val bestscore: KTable[Int, LikeCount] = groupedBylike
+      //      .count()(Materialized.as(StoreView).withValueSerde(Serdes.Long))
+      .aggregate(LikeCount(0,0,0)){ (_, newValue , currentValue) =>
+        val newvallike = newValue.as[Like]
+        //val likecount = likecount.as[LikeCount]
+        LikeCount(id = newvallike._id,count = currentValue.count+1 , somme = currentValue.somme+ newvallike.score)
+      }(Materialized.as(StoreLike).withValueSerde(toSerde))
 
     val oneMinuteTable: KTable[Windowed[Int], Long] = oneMinuteWindowedVisits
       .aggregate(0L)((_, _, currentValue) => currentValue + 1)(Materialized.as(oneMinuteStoreName).withValueSerde(Serdes.Long)) // aggregate version
@@ -122,11 +139,11 @@ object Main extends PlayJsonSupport with coucou {
     get {
       import scala.collection.JavaConverters._
       period match {
-        case "30s" =>
+        case "ten/best/views" =>
           // load our materialized store
           val best: ReadOnlyKeyValueStore[Int, view_count] = streams.store( StoreView, QueryableStoreTypes.keyValueStore[Int, view_count]())
           // fetch all available keys
-          val availableKeys = best.all().asScala.toList.sortBy(_.value.view_count).take(10)
+          val availableKeys = best.all().asScala.toList.sortBy(_.value.view_count).reverse.take(10)
           // define our time interval to fetch the last window (nearest one to now)
           //val toTime = Instant.now().toEpochMilli
           //val fromTime = toTime - (30 * 1000)
@@ -136,15 +153,27 @@ object Main extends PlayJsonSupport with coucou {
               for(k<-availableKeys)
             yield BestView(title=k.value.title, views=k.value.view_count)
       )
-        case "1m" =>
+        case "ten/worst/views" =>
+
+          val best: ReadOnlyKeyValueStore[Int, view_count] = streams.store( StoreView, QueryableStoreTypes.keyValueStore[Int, view_count]())
+          // fetch all available keys
+          val availableKeys = best.all().asScala.toList.sortBy(_.value.view_count).take(10)
           // do the same for a 1 minute window
           complete(
-            HttpResponse(StatusCodes.NotFound, entity = "Not found")
+            for(k<-availableKeys)
+              yield BestView(title=k.value.title, views=k.value.view_count)
+
           )
         case "5m" =>
+
+          val best: ReadOnlyKeyValueStore[Int, LikeCount] = streams.store( StoreLike, QueryableStoreTypes.keyValueStore[Int, LikeCount]())
+          // fetch all available keys
+          val availableKeys = best.all().asScala.toList
           // do the same for a 5 minutes window
           complete(
-            HttpResponse(StatusCodes.NotFound, entity = "Not found")
+            for(k<-availableKeys)
+              yield BestScore(id=k.value.id, score=k.value.somme/ k.value.count)
+
           )
         case _ =>
           // unhandled period asked
