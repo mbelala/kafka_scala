@@ -1,1 +1,1 @@
-# kafka_scala
+# Kafka Stream Exercice solution
